@@ -12,13 +12,12 @@ To view your cameras from anywhere for free:
 
 ### 2. Enable Auto-Updates (GitHub)
 To get the app to update itself automatically:
-- **Update package.json**: Change `YOUR_GITHUB_USERNAME` to your real GitHub username.
 - **Initialize Git**:
   ```bash
   git init
   git add .
   git commit -m "Initial commit"
-  git remote add origin https://github.com/YOUR_GITHUB_USERNAME/ZOSIView.git
+  git remote add origin https://github.com/ItssKairo/ZOSIView.git
   git push -u origin main
   ```
 - **Create a Release**: When you want to push an update, change the version in `package.json` (e.g., to `1.0.1`), build the app, and upload it to a "New Release" on GitHub.

@@ -15,7 +15,7 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "YOUR_GITHUB_USERNAME",
+        "owner": "ItssKairo",
         "repo": "ZOSIView"
       }
     ],
