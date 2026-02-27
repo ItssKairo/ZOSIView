@@ -1,0 +1,18 @@
+node_modules/
+dist/
+release/
+build/
+out/
+ZOSIView-*/
+*.log
+.DS_Store
+settings.txt
+settings.json
+# Mobile artifacts
+mobile/android/app/build/
+mobile/android/.gradle/
+mobile/android/local.properties
+mobile/android/*.apk
+mobile/android/*.bundle
+mobile/android/*.keystore
+mobile/node_modules/

@@ -1,0 +1,46 @@
+{
+  "name": "zosiview",
+  "version": "1.0.0",
+  "description": "Simple desktop monitoring app for 4 IP cameras",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "package:mac": "electron-packager . ZOSIView --platform=darwin --arch=x64 --overwrite",
+    "package:win": "electron-packager . ZOSIView --platform=win32 --arch=x64 --overwrite",
+    "make:mac": "electron-builder --mac",
+    "make:win": "electron-builder --win"
+  },
+  "build": {
+    "appId": "com.cormac.zosiview",
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "YOUR_GITHUB_USERNAME",
+        "repo": "ZOSIView"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.utilities"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    }
+  },
+  "keywords": [
+    "camera",
+    "monitoring",
+    "electron"
+  ],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "electron": "^28.2.0",
+    "electron-builder": "^26.8.1",
+    "electron-packager": "^17.1.2"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.3"
+  }
+}

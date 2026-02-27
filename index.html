@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>ZOSI Monitor</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <div id="grid" class="grid-view">
+      <div class="camera-wrapper" id="cam1" data-id="1">
+        <div class="status-indicator" id="status1"></div>
+        <img id="img1" src="" alt="Camera 1 Feed">
+        <div class="loading-overlay">
+          <div class="spinner"></div>
+          <div>Loading Cam 1...</div>
+        </div>
+      </div>
+      <div class="camera-wrapper" id="cam2" data-id="2">
+        <div class="status-indicator" id="status2"></div>
+        <img id="img2" src="" alt="Camera 2 Feed">
+        <div class="loading-overlay">
+          <div class="spinner"></div>
+          <div>Loading Cam 2...</div>
+        </div>
+      </div>
+      <div class="camera-wrapper" id="cam3" data-id="3">
+        <div class="status-indicator" id="status3"></div>
+        <img id="img3" src="" alt="Camera 3 Feed">
+        <div class="loading-overlay">
+          <div class="spinner"></div>
+          <div>Loading Cam 3...</div>
+        </div>
+      </div>
+      <div class="camera-wrapper" id="cam4" data-id="4">
+        <div class="status-indicator" id="status4"></div>
+        <img id="img4" src="" alt="Camera 4 Feed">
+        <div class="loading-overlay">
+          <div class="spinner"></div>
+          <div>Loading Cam 4...</div>
+        </div>
+      </div>
+    </div>
+    
+    <div id="debug-overlay" class="hidden">
+      <h3>Debug Information</h3>
+      <div id="debug-content"></div>
+    </div>
+
+    <!-- Settings Overlay -->
+    <div id="settings-overlay" class="hidden">
+      <h3>Settings</h3>
+      <div class="settings-content">
+        <div class="settings-group">
+          <label for="refresh-interval">Refresh Interval (seconds):</label>
+          <input type="number" id="refresh-interval" min="2" max="60" value="5">
+        </div>
+        
+        <div class="settings-group">
+          <label>Candidate Hosts (one per line):</label>
+          <textarea id="candidate-hosts" rows="6" placeholder="10.1.1.189&#10;192.168.1.100"></textarea>
+          <div class="hint">These IPs will be probed when connection is lost.</div>
+        </div>
+
+        <div class="camera-urls">
+            <!-- Dynamically populated by renderer.js -->
+        </div>
+
+        <div class="settings-actions">
+          <button id="save-settings" class="btn primary">Save & Apply</button>
+          <button id="cancel-settings" class="btn secondary">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script src="renderer.js"></script>
+</body>
+</html>
