@@ -1,78 +1,141 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'">
   <title>ZOSI Monitor</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <div id="app">
-    <div id="grid" class="grid-view">
-      <div class="camera-wrapper" id="cam1" data-id="1">
-        <div class="status-indicator" id="status1"></div>
-        <img id="img1" src="" alt="Camera 1 Feed">
-        <div class="loading-overlay">
-          <div class="spinner"></div>
-          <div>Loading Cam 1...</div>
-        </div>
+
+    <!-- ── Status Bar ── -->
+    <div id="status-bar">
+      <div class="sb-left">
+        <span class="sb-brand">ZOSI <span class="accent">MONITOR</span></span>
+        <span class="sb-sep">|</span>
+        <span id="global-status" data-status="scanning">◌ Scanning…</span>
       </div>
-      <div class="camera-wrapper" id="cam2" data-id="2">
-        <div class="status-indicator" id="status2"></div>
-        <img id="img2" src="" alt="Camera 2 Feed">
-        <div class="loading-overlay">
-          <div class="spinner"></div>
-          <div>Loading Cam 2...</div>
-        </div>
-      </div>
-      <div class="camera-wrapper" id="cam3" data-id="3">
-        <div class="status-indicator" id="status3"></div>
-        <img id="img3" src="" alt="Camera 3 Feed">
-        <div class="loading-overlay">
-          <div class="spinner"></div>
-          <div>Loading Cam 3...</div>
-        </div>
-      </div>
-      <div class="camera-wrapper" id="cam4" data-id="4">
-        <div class="status-indicator" id="status4"></div>
-        <img id="img4" src="" alt="Camera 4 Feed">
-        <div class="loading-overlay">
-          <div class="spinner"></div>
-          <div>Loading Cam 4...</div>
-        </div>
+      <div class="sb-right">
+        <span id="status-clock"></span>
+        <span class="sb-hint">[ M ] Menu</span>
       </div>
     </div>
-    
-    <div id="debug-overlay" class="hidden">
-      <h3>Debug Information</h3>
+
+    <!-- ── Camera Grid ── -->
+    <div id="grid" class="grid-view">
+
+      <div class="camera-wrapper" id="cam2" tabindex="0">
+        <div class="status-indicator" id="status2"></div>
+        <img id="img2" src="" alt="Camera 2">
+        <div class="loading-overlay">
+          <div class="spinner"></div>
+          <div>ACQUIRING FEED…</div>
+        </div>
+
+      </div>
+
+      <div class="camera-wrapper" id="cam1" tabindex="0">
+        <div class="status-indicator" id="status1"></div>
+        <img id="img1" src="" alt="Camera 1">
+        <div class="loading-overlay">
+          <div class="spinner"></div>
+          <div>ACQUIRING FEED…</div>
+        </div>
+
+      </div>
+
+      <div class="camera-wrapper" id="cam3" tabindex="0">
+        <div class="status-indicator" id="status3"></div>
+        <img id="img3" src="" alt="Camera 3">
+        <div class="loading-overlay">
+          <div class="spinner"></div>
+          <div>ACQUIRING FEED…</div>
+        </div>
+
+      </div>
+
+      <div class="camera-wrapper" id="cam4" tabindex="0">
+        <div class="status-indicator" id="status4"></div>
+        <img id="img4" src="" alt="Camera 4">
+        <div class="loading-overlay">
+          <div class="spinner"></div>
+          <div>ACQUIRING FEED…</div>
+        </div>
+
+      </div>
+
+    </div><!-- /grid -->
+
+    <!-- ── Main Menu Overlay ── -->
+    <div id="menu-overlay" class="hidden" role="dialog" aria-label="Main Menu">
+      <div class="menu-backdrop"></div>
+      <nav class="menu-panel">
+        <div class="menu-eyebrow">ZOSI <span class="accent">MONITOR</span></div>
+        <ul class="menu-list">
+          <li class="menu-item" id="menu-feed" role="button" tabindex="0">
+            <kbd class="menu-key">F</kbd>
+            <span class="menu-title">FEED</span>
+            <span class="menu-sub">Return to live view</span>
+          </li>
+          <li class="menu-item" id="menu-settings" role="button" tabindex="0">
+            <kbd class="menu-key">S</kbd>
+            <span class="menu-title">SETTINGS</span>
+            <span class="menu-sub">Refresh interval &amp; hosts</span>
+          </li>
+          <li class="menu-item" id="menu-debug" role="button" tabindex="0">
+            <kbd class="menu-key">=</kbd>
+            <span class="menu-title">DIAGNOSTICS</span>
+            <span class="menu-sub">Network &amp; feed performance</span>
+          </li>
+        </ul>
+        <div class="menu-esc-hint">ESC — Close</div>
+      </nav>
+    </div>
+
+    <!-- ── Debug Overlay ── -->
+    <div id="debug-overlay" class="hidden" role="dialog" aria-label="Diagnostics">
+      <div class="panel-header">
+        <span class="panel-title">DIAGNOSTICS</span>
+        <button class="close-btn" id="close-debug" aria-label="Close">✕</button>
+      </div>
       <div id="debug-content"></div>
     </div>
 
-    <!-- Settings Overlay -->
-    <div id="settings-overlay" class="hidden">
-      <h3>Settings</h3>
-      <div class="settings-content">
-        <div class="settings-group">
-          <label for="refresh-interval">Refresh Interval (seconds):</label>
-          <input type="number" id="refresh-interval" min="2" max="60" value="5">
-        </div>
-        
-        <div class="settings-group">
-          <label>Candidate Hosts (one per line):</label>
-          <textarea id="candidate-hosts" rows="6" placeholder="10.1.1.189&#10;192.168.1.100"></textarea>
-          <div class="hint">These IPs will be probed when connection is lost.</div>
+    <!-- ── Settings Overlay ── -->
+    <div id="settings-overlay" class="hidden" role="dialog" aria-label="Settings">
+      <div class="settings-window">
+        <div class="panel-header">
+          <span class="panel-title">SETTINGS</span>
+          <button class="close-btn" id="cancel-settings" aria-label="Close">✕</button>
         </div>
 
-        <div class="camera-urls">
-            <!-- Dynamically populated by renderer.js -->
+        <div class="settings-content">
+
+          <div class="settings-group">
+            <label for="refresh-interval">Refresh Interval</label>
+            <div class="input-with-unit">
+              <input type="number" id="refresh-interval" min="1" max="60" value="5">
+              <span class="unit-label">seconds</span>
+            </div>
+          </div>
+
+          <div class="settings-group">
+            <label for="candidate-hosts">Candidate Hosts</label>
+            <textarea id="candidate-hosts" rows="7" placeholder="10.1.1.189&#10;192.168.1.100"></textarea>
+            <p class="hint">One IP per line — tested first on reconnect before subnet scan (10.1.1.180–210).</p>
+          </div>
+
         </div>
 
         <div class="settings-actions">
-          <button id="save-settings" class="btn primary">Save & Apply</button>
-          <button id="cancel-settings" class="btn secondary">Cancel</button>
+          <button class="btn secondary" id="cancel-settings-2">Cancel</button>
+          <button class="btn primary" id="save-settings">Save &amp; Apply</button>
         </div>
       </div>
     </div>
-  </div>
+
+  </div><!-- /app -->
   <script src="renderer.js"></script>
 </body>
 </html>

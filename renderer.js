@@ -1,538 +1,749 @@
+'use strict';
+
 /**
  * Renderer Process Script
- * Handles UI logic, camera feed management, and settings.
+ * Camera feed manager — Electron renderer process.
+ *
+ * HTTP Architecture:
+ *   The renderer makes ZERO direct network requests.
+ *   All camera probing and image fetching is done via window.electronAPI,
+ *   which invokes IPC handlers in the main process. This keeps the CSP clean.
+ *
+ * Boot Sequence:
+ *   1. Load settings via IPC.
+ *   2. Check localStorage for a cached host — test it first (fast path).
+ *   3. If the cached host is alive, skip the subnet scan entirely.
+ *   4. Otherwise scan 10.1.1.180–210 sequentially via IPC check-host calls.
+ *   5. Cache the found host to localStorage for the next boot.
+ *   6. Fire all 4 cameras simultaneously for the first frame (sync).
+ *   7. Repeat on a staggered interval to reduce NVR load.
+ *
+ * Keyboard shortcuts:
+ *   M     — Toggle main menu
+ *   F     — Close menu / return to feed (from menu)
+ *   S     — Open settings directly
+ *   =     — Open diagnostics directly
+ *   Esc   — Close active overlay or exit fullscreen
+ *   Click — Toggle camera fullscreen
  */
 
-// --- Constants & Config ---
-const CAMERAS_COUNT = 4;
-const DEFAULT_REFRESH_INTERVAL = 5;
-const MAX_ERRORS_BEFORE_SCAN = 5;
+// ─── Constants ───────────────────────────────────────────────────────────────
 
-// --- Utility Functions ---
+const CONFIG = Object.freeze({
+  CAMERA_COUNT:           4,
+  DEFAULT_REFRESH_MS:     5_000,
+
+  SCAN_SUBNET_BASE:       '10.1.1',
+  SCAN_SUBNET_START:      180,
+  SCAN_SUBNET_END:        210,
+  PROBE_BATCH_SIZE:       6,
+
+  MAX_ERRORS_BEFORE_SCAN: 5,
+  ERROR_HISTORY_LIMIT:    10,
+  STAGGER_MS:             200,
+
+  DEBUG_UPDATE_MS:        1_000,
+  STORAGE_KEY_HOST:       'lastActiveHost',
+});
+
+const DEFAULT_ADJUSTMENTS = Object.freeze({
+  1: { brightness: 105, contrast: 105, saturate: 110, rotation: 0 },
+  2: { brightness: 100, contrast: 100, saturate:  90, rotation: 0 },
+  3: { brightness: 110, contrast:  95, saturate: 115, rotation: 0 },
+  4: { brightness: 100, contrast: 120, saturate: 105, rotation: 0 },
+});
+
+const DEFAULT_URL_TEMPLATES = Object.freeze({
+  1: 'http://10.1.1.189/cgi-bin/snapshot.cgi?chn=1&u=admin&p=&q=0&d=1',
+  2: 'http://10.1.1.189/cgi-bin/snapshot.cgi?chn=0&u=admin&p=&q=0&d=1',
+  3: 'http://10.1.1.189/cgi-bin/snapshot.cgi?chn=2&u=admin&p=&q=0&d=1',
+  4: 'http://10.1.1.189/cgi-bin/snapshot.cgi?chn=3&u=admin&p=&q=0&d=1',
+});
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
+
 function formatBytes(bytes) {
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), sizes.length - 1);
+  return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${sizes[i]}`;
 }
 
-function getTimestamp() {
+function timestamp() {
   return new Date().toLocaleTimeString();
 }
 
-// --- Classes ---
+function freshRand() {
+  return Math.random().toString().slice(2);
+}
 
-class NetworkManager {
-  constructor(app) {
-    this.app = app;
-    this.activeHost = null;
-    this.isScanning = false;
-    this.candidateHosts = [];
-    this.consecutiveErrors = 0;
+// ─── EventBus ────────────────────────────────────────────────────────────────
+
+class EventBus {
+  constructor() { this._listeners = new Map(); }
+
+  on(event, fn) {
+    if (!this._listeners.has(event)) this._listeners.set(event, new Set());
+    this._listeners.get(event).add(fn);
   }
 
-  setCandidates(hosts) {
-    // Filter valid non-empty strings and remove duplicates
-    this.candidateHosts = [...new Set(hosts.filter(h => h && h.trim().length > 0))];
-  }
+  off(event, fn) { this._listeners.get(event)?.delete(fn); }
 
-  async findActiveHost() {
-    if (this.isScanning) return;
-    this.isScanning = true;
-    this.app.ui.updateGlobalStatus('connecting');
-    console.log('Scanning for active camera host...');
-
-    // Combine current active host (if any) with candidates to check all possibilities
-    const hostsToCheck = new Set(this.candidateHosts);
-    if (this.activeHost) hostsToCheck.add(this.activeHost);
-
-    const checks = Array.from(hostsToCheck).map(host => this.checkHost(host));
-
-    try {
-      const validHost = await Promise.any(checks);
-      if (validHost) {
-        console.log('Found active host:', validHost);
-        this.activeHost = validHost;
-        this.consecutiveErrors = 0;
-        this.app.ui.updateGlobalStatus('online');
-        this.app.restartFeeds();
-      }
-    } catch (e) {
-      console.warn('No active host found in candidates.');
-      this.app.ui.updateGlobalStatus('offline');
-    } finally {
-      this.isScanning = false;
-    }
-  }
-
-  checkHost(host) {
-    return new Promise((resolve, reject) => {
-      // Construct a probe URL. 
-      // We try to use the path from Camera 1 if available, otherwise just the root.
-      let probeUrl = `http://${host}`;
-      const cam1Url = this.app.settings.camera1_url;
-      if (cam1Url) {
-        try {
-          const u = new URL(cam1Url);
-          u.hostname = host;
-          probeUrl = u.toString();
-        } catch (e) {
-          // If URL parsing fails, stick to root
-        }
-      }
-
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 2000);
-
-      fetch(probeUrl, { method: 'GET', signal: controller.signal })
-        .then(res => {
-          clearTimeout(timeoutId);
-          // Accept OK, Unauthorized (401), or Forbidden (403) as signs of life
-          if (res.ok || res.status === 401 || res.status === 403) {
-            resolve(host);
-          } else {
-            reject(new Error('Unreachable or wrong device'));
-          }
-        })
-        .catch(err => {
-          clearTimeout(timeoutId);
-          reject(err);
-        });
+  emit(event, ...args) {
+    this._listeners.get(event)?.forEach(fn => {
+      try { fn(...args); }
+      catch (err) { console.error(`[EventBus] "${event}":`, err); }
     });
   }
 
+  destroy() { this._listeners.clear(); }
+}
+
+// ─── NetworkManager ───────────────────────────────────────────────────────────
+
+/**
+ * Discovers and tracks the active camera NVR host.
+ * All HTTP is done via window.electronAPI.checkHost() in the main process.
+ *
+ * Events: 'network:online', 'network:offline', 'network:scanning'
+ */
+class NetworkManager {
+  constructor(bus) {
+    this._bus               = bus;
+    this._isScanning        = false;
+    this._consecutiveErrors = 0;
+    this._candidateHosts    = [];
+
+    try {
+      this.activeHost = localStorage.getItem(CONFIG.STORAGE_KEY_HOST) || null;
+    } catch {
+      this.activeHost = null;
+    }
+  }
+
+  setCandidates(hosts) {
+    this._candidateHosts = [...new Set(hosts.map(h => h.trim()).filter(Boolean))];
+  }
+
+  async findActiveHost() {
+    if (this._isScanning) return;
+    this._isScanning = true;
+    this._bus.emit('network:scanning');
+    console.log('[Network] Starting host discovery…');
+
+    try {
+      // Fast path: test cached host alone first
+      if (this.activeHost) {
+        console.log(`[Network] Testing cached host ${this.activeHost}…`);
+        if (await this._probeOne(this.activeHost)) {
+          console.log(`[Network] Cached host alive — skipping scan.`);
+          this._consecutiveErrors = 0;
+          this._bus.emit('network:online', this.activeHost);
+          return;
+        }
+        console.log('[Network] Cached host offline — scanning subnet.');
+      }
+
+      const found = await this._probeBatched(this._buildScanList());
+
+      if (found) {
+        console.log('[Network] Found host:', found);
+        this.activeHost = found;
+        try { localStorage.setItem(CONFIG.STORAGE_KEY_HOST, found); } catch { /* quota */ }
+        this._consecutiveErrors = 0;
+        this._bus.emit('network:online', found);
+      } else {
+        console.warn('[Network] No host found.');
+        this.activeHost = null;
+        this._bus.emit('network:offline');
+      }
+    } finally {
+      this._isScanning = false;
+    }
+  }
+
+  _buildScanList() {
+    const set = new Set(this._candidateHosts);
+    for (let i = CONFIG.SCAN_SUBNET_START; i <= CONFIG.SCAN_SUBNET_END; i++) {
+      set.add(`${CONFIG.SCAN_SUBNET_BASE}.${i}`);
+    }
+    if (this.activeHost) set.delete(this.activeHost); // already tested
+    return [...set];
+  }
+
+  async _probeOne(host) {
+    try { return (await window.electronAPI.checkHost(host))?.ok === true; }
+    catch { return false; }
+  }
+
+  async _probeBatched(hosts) {
+    for (let i = 0; i < hosts.length; i += CONFIG.PROBE_BATCH_SIZE) {
+      const batch  = hosts.slice(i, i + CONFIG.PROBE_BATCH_SIZE);
+      const probes = batch.map(host =>
+        this._probeOne(host).then(ok => { if (ok) return host; throw new Error(); })
+      );
+      try { return await Promise.any(probes); }
+      catch { /* batch failed */ }
+    }
+    return null;
+  }
+
   reportError() {
-    this.consecutiveErrors++;
-    if (this.consecutiveErrors > MAX_ERRORS_BEFORE_SCAN && !this.isScanning) {
-      console.log('Too many errors, triggering network scan...');
+    this._consecutiveErrors++;
+    if (this._consecutiveErrors > CONFIG.MAX_ERRORS_BEFORE_SCAN && !this._isScanning) {
+      console.log(`[Network] ${this._consecutiveErrors} errors — re-scanning.`);
       this.findActiveHost();
     }
   }
 
   reportSuccess() {
-    if (this.consecutiveErrors > 0) {
-      this.consecutiveErrors = 0;
-      this.app.ui.updateGlobalStatus('online');
+    if (this._consecutiveErrors > 0) {
+      this._consecutiveErrors = 0;
+      this._bus.emit('network:online', this.activeHost);
     }
   }
+
+  destroy() {}
 }
 
+// ─── CameraFeed ───────────────────────────────────────────────────────────────
+
+/**
+ * Manages a single camera tile.
+ * Fetches via IPC, displays frames as data: URLs (CSP-compliant).
+ */
 class CameraFeed {
-  constructor(id, app) {
-    this.id = id;
-    this.app = app;
-    this.element = document.getElementById(`cam${id}`);
-    this.imgElement = document.getElementById(`img${id}`);
-    this.statusIndicator = document.getElementById(`status${id}`);
-    this.loadingOverlay = this.element.querySelector('.loading-overlay');
-    this.loadingText = this.loadingOverlay.querySelector('div:last-child');
-    
-    this.isFetching = false;
-    this.stats = {
-      bytes: 0,
-      totalBytes: 0,
-      errors: [],
-      lastFetch: null,
-      fetchCount: 0
+  constructor(id, bus, network, settings) {
+    this.id        = id;
+    this._bus      = bus;
+    this._network  = network;
+    this._settings = settings;
+    this._isFetching = false;
+
+    this.stats = { bytes: 0, totalBytes: 0, errors: [], lastFetch: null, fetchCount: 0 };
+
+    this.adjustments = {
+      ...(DEFAULT_ADJUSTMENTS[this.id] || { brightness: 100, contrast: 100, saturate: 100, rotation: 0 }),
+      ...(settings[`camera${this.id}_adjustments`] || {}),
     };
 
-    // Attach event listener for fullscreen
-    this.element.addEventListener('click', () => this.app.ui.toggleFullscreen(this.id));
-    
-    // Set initial placeholder
-    this.setPlaceholder('Initializing...');
+    this._wrapper    = this._requireEl(`cam${id}`);
+    this._img        = this._requireEl(`img${id}`);
+    this._statusDot  = this._requireEl(`status${id}`);
+    this._loadingEl  = this._wrapper.querySelector('.loading-overlay');
+    this._loadingTxt = this._loadingEl?.querySelector('div:last-child') ?? null;
+
+    this._wrapper.addEventListener('click', () =>
+      this._bus.emit('ui:toggleFullscreen', this.id)
+    );
+
+    this._setLoadingMessage('Waiting for network…');
+    this._applyAdjustments();
   }
 
-  setPlaceholder(text) {
-      this.element.setAttribute('data-placeholder', text);
+  _requireEl(id) {
+    const el = document.getElementById(id);
+    if (!el) throw new Error(`CameraFeed ${this.id}: #${id} not found.`);
+    return el;
   }
 
-  setLoading(message) {
-    if (this.loadingOverlay) {
-        this.loadingText.textContent = message || `Loading Cam ${this.id}...`;
-        this.loadingOverlay.style.display = 'flex';
-    }
+  _applyAdjustments() {
+    const { brightness, contrast, saturate, rotation } = this.adjustments;
+    this._img.style.filter    = `brightness(${brightness}%) contrast(${contrast}%) saturate(${saturate}%)`;
+    this._img.style.transform = `rotate(${rotation}deg)`;
   }
 
-  hideLoading() {
-    if (this.loadingOverlay) {
-        this.loadingOverlay.style.display = 'none';
-    }
+  updateAdjustments(partial) {
+    Object.assign(this.adjustments, partial);
+    this._applyAdjustments();
   }
 
-  setStatus(status) {
-    // status: 'online', 'offline', 'connecting'
-    if (this.statusIndicator) {
-      this.statusIndicator.className = `status-indicator status-${status}`;
-    }
+  _setLoadingMessage(msg) {
+    if (this._loadingTxt) this._loadingTxt.textContent = msg;
+    if (this._loadingEl)  this._loadingEl.style.display = 'flex';
+  }
+
+  _hideLoading() {
+    if (this._loadingEl) this._loadingEl.style.display = 'none';
+  }
+
+  _setStatus(status) {
+    this._statusDot.className = `status-indicator status-${status}`;
+    this._bus.emit('camera:status', { id: this.id, status });
   }
 
   async update() {
-    const originalUrl = this.app.settings[`camera${this.id}_url`];
-    if (!originalUrl) {
-      this.setLoading('Not Configured');
-      return;
-    }
+    if (this._isFetching) return;
+    if (!this._network.activeHost) { this._setLoadingMessage('Scanning for NVR…'); return; }
 
-    if (this.isFetching) return;
-    this.isFetching = true;
+    const rawUrl = this._settings[`camera${this.id}_url`] || DEFAULT_URL_TEMPLATES[this.id];
+    if (!rawUrl) { this._setLoadingMessage('Not configured'); return; }
 
-    // Construct URL with dynamic host if available
-    let finalUrl = originalUrl;
-    if (this.app.network.activeHost) {
-      try {
-        const u = new URL(originalUrl);
-        u.hostname = this.app.network.activeHost;
-        finalUrl = u.toString();
-      } catch (e) {
-        console.error(`Error constructing URL for Cam ${this.id}:`, e);
-      }
-    }
-
-    // Add timestamp to prevent caching
-    const timestamp = new Date().getTime();
-    const separator = finalUrl.includes('?') ? '&' : '?';
-    const newSrc = `${finalUrl}${separator}_t=${timestamp}`;
-
-    const controller = new AbortController();
-    const timeoutMs = Math.max(5000, (this.app.settings.refresh_interval || DEFAULT_REFRESH_INTERVAL) * 2000);
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
+    this._isFetching = true;
     try {
-      const response = await fetch(newSrc, { signal: controller.signal });
-      clearTimeout(timeoutId);
+      const url    = this._buildFetchUrl(rawUrl);
+      const result = await window.electronAPI.fetchCamera(url);
+      if (result.error) throw new Error(result.error);
 
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const dataUrl = `data:${result.mimeType};base64,${result.data}`;
+      await this._validateAndDisplay(dataUrl, result.data.length);
 
-      const blob = await response.blob();
-      const objectUrl = URL.createObjectURL(blob);
-
-      // Create a temp image to validate the blob
-      await new Promise((resolve, reject) => {
-        const tempImg = new Image();
-        tempImg.onload = () => {
-          this.updateImageSource(objectUrl, blob.size);
-          resolve();
-        };
-        tempImg.onerror = () => {
-            URL.revokeObjectURL(objectUrl);
-            reject(new Error('Image decode failed'));
-        };
-        tempImg.src = objectUrl;
-      });
-
-      this.app.network.reportSuccess();
-      this.setStatus('online');
-      this.hideLoading();
-
+      this._network.reportSuccess();
+      this._setStatus('online');
+      this._hideLoading();
     } catch (err) {
-      this.handleError(err);
+      this._handleError(err);
     } finally {
-      this.isFetching = false;
+      this._isFetching = false;
     }
   }
 
-  updateImageSource(objectUrl, size) {
-    // Revoke old URL to prevent memory leaks
-    if (this.imgElement.src.startsWith('blob:')) {
-      URL.revokeObjectURL(this.imgElement.src);
-    }
-    this.imgElement.src = objectUrl;
-    
-    // Update stats
-    this.stats.lastFetch = getTimestamp();
-    this.stats.bytes = size;
-    this.stats.totalBytes += size;
-    this.stats.fetchCount++;
+  _buildFetchUrl(template) {
+    let url = template;
+    try {
+      const u = new URL(template);
+      u.hostname = this._network.activeHost;
+      url = u.toString();
+    } catch (e) { console.error(`[Cam ${this.id}] Bad URL:`, e); }
+    const sep = url.includes('?') ? '&' : '?';
+    return `${url}${sep}rand=${freshRand()}&_t=${Date.now()}`;
   }
 
-  handleError(err) {
-    let errorMsg = err.message || 'Fetch failure';
-    if (err.name === 'AbortError') errorMsg = 'Timeout';
-
-    // Log error but limit history
-    this.stats.errors.push(`${getTimestamp()}: ${errorMsg}`);
-    if (this.stats.errors.length > 10) this.stats.errors.shift();
-
-    // Only log significant errors to console
-    if (err.name !== 'AbortError') {
-      console.warn(`Camera ${this.id} error:`, err);
-    }
-
-    this.setStatus('offline');
-    this.setPlaceholder('Connection Failed');
-    
-    // Hide image if it's broken/old
-    // this.imgElement.src = ''; // Optional: Clear image on error? 
-    // Usually better to keep last good frame, but if it's really old it might be misleading.
-    // For now, let's keep the last frame but show status indicator.
-
-    this.app.network.reportError();
+  _validateAndDisplay(dataUrl, byteCount) {
+    return new Promise((resolve, reject) => {
+      const tmp = new Image();
+      tmp.onload  = () => {
+        this._img.src         = dataUrl;
+        this.stats.lastFetch   = timestamp();
+        this.stats.bytes       = Math.floor(byteCount * 0.75);
+        this.stats.totalBytes += this.stats.bytes;
+        this.stats.fetchCount++;
+        resolve();
+      };
+      tmp.onerror = () => reject(new Error('Image decode failed'));
+      tmp.src = dataUrl;
+    });
   }
+
+  _handleError(err) {
+    const label = err.message || 'Unknown error';
+    this.stats.errors.push(`${timestamp()}: ${label}`);
+    if (this.stats.errors.length > CONFIG.ERROR_HISTORY_LIMIT) this.stats.errors.shift();
+    console.warn(`[Cam ${this.id}]`, label);
+    this._setStatus('offline');
+    this._network.reportError();
+  }
+
+  destroy() {}
 }
 
+// ─── UIManager ────────────────────────────────────────────────────────────────
+
+/**
+ * Owns all DOM interaction: menu, debug, settings, fullscreen, status bar clock.
+ * Communicates with other subsystems only through EventBus.
+ */
 class UIManager {
-  constructor(app) {
-    this.app = app;
-    this.fullscreenCamId = null;
-    this.isDebugVisible = false;
-    this.isSettingsVisible = false;
+  constructor(bus, settings, cameras, network) {
+    this._bus      = bus;
+    this._settings = settings;
+    this._cameras  = cameras;
+    this._network  = network;
 
-    // Elements
-    this.debugOverlay = document.getElementById('debug-overlay');
-    this.debugContent = document.getElementById('debug-content');
-    this.settingsOverlay = document.getElementById('settings-overlay');
-    
-    // Inputs
-    this.refreshInput = document.getElementById('refresh-interval');
-    this.hostsInput = document.getElementById('candidate-hosts');
-    this.camInputs = {};
-    [1, 2, 3, 4].forEach(id => {
-        // We need to add these inputs to the settings modal dynamically or assume they exist
-        // For now, let's assume we will add them to HTML
-    });
+    this._fullscreenId      = null;
+    this._isMenuVisible     = false;
+    this._isDebugVisible    = false;
+    this._isSettingsVisible = false;
+    this._debugTimer        = null;
+    this._clockTimer        = null;
 
-    this.setupEventListeners();
-    this.startDebugLoop();
+    this._menuOverlay     = this._requireEl('menu-overlay');
+    this._debugOverlay    = this._requireEl('debug-overlay');
+    this._debugContent    = this._requireEl('debug-content');
+    this._settingsOverlay = this._requireEl('settings-overlay');
+    this._refreshInput    = this._requireEl('refresh-interval');
+    this._hostsInput      = this._requireEl('candidate-hosts');
+    this._globalBadge     = document.getElementById('global-status');
+    this._clockEl         = document.getElementById('status-clock');
+
+    this._bindKeyboard();
+    this._bindMenu();
+    this._bindSettings();
+    this._bindDebug();
+    this._bindBusEvents();
+    this._startClock();
   }
 
-  setupEventListeners() {
-    // Keyboard shortcuts
-    window.addEventListener('keydown', (e) => {
-      const isInput = ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName);
-      if (e.key === '=' && !isInput) this.toggleDebug();
-      if ((e.key === 's' || e.key === 'S') && !isInput) this.toggleSettings();
-      if (e.key === 'Escape') {
-        if (this.isSettingsVisible) this.toggleSettings();
-        if (this.fullscreenCamId) this.exitFullscreen();
-      }
-    });
-
-    // Settings buttons
-    document.getElementById('save-settings').addEventListener('click', () => this.saveSettings());
-    document.getElementById('cancel-settings').addEventListener('click', () => this.toggleSettings());
+  _requireEl(id) {
+    const el = document.getElementById(id);
+    if (!el) throw new Error(`UIManager: #${id} not found.`);
+    return el;
   }
 
-  toggleFullscreen(id) {
-    if (this.fullscreenCamId) {
-      this.exitFullscreen();
-    } else {
-      const wrapper = document.getElementById(`cam${id}`);
-      if (wrapper) {
-        wrapper.classList.add('fullscreen');
-        this.fullscreenCamId = id;
+  // ── Clock ─────────────────────────────────────────────────────────────────
+
+  _startClock() {
+    const tick = () => {
+      if (this._clockEl) {
+        this._clockEl.textContent = new Date().toLocaleTimeString([], {
+          hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+        });
       }
+    };
+    tick();
+    this._clockTimer = setInterval(tick, 1_000);
+  }
+
+  // ── Keyboard ──────────────────────────────────────────────────────────────
+
+  _bindKeyboard() {
+    this._onKeyDown = (e) => {
+      const inInput = ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName);
+      if (inInput && e.key !== 'Escape') return;
+
+      switch (e.key) {
+        case 'm': case 'M':
+          this.toggleMenu(); break;
+
+        case 'f': case 'F':
+          if (this._isMenuVisible) this.toggleMenu(); break;
+
+        case 's': case 'S':
+          if (!this._isSettingsVisible) {
+            if (this._isMenuVisible) this.toggleMenu();
+            this.toggleSettings();
+          }
+          break;
+
+        case '=':
+          if (!this._isDebugVisible) {
+            if (this._isMenuVisible) this.toggleMenu();
+            this.toggleDebug();
+          }
+          break;
+
+        case 'Escape':
+          if (this._isMenuVisible)     { this.toggleMenu();     break; }
+          if (this._isSettingsVisible) { this.toggleSettings(); break; }
+          if (this._isDebugVisible)    { this.toggleDebug();    break; }
+          if (this._fullscreenId)      { this._exitFullscreen();break; }
+          break;
+      }
+    };
+    window.addEventListener('keydown', this._onKeyDown);
+  }
+
+  // ── Menu ──────────────────────────────────────────────────────────────────
+
+  _bindMenu() {
+    const menuItems = {
+      'menu-feed':     () => { this.toggleMenu(); },
+      'menu-settings': () => { this.toggleMenu(); this.toggleSettings(); },
+      'menu-debug':    () => { this.toggleMenu(); this.toggleDebug(); },
+    };
+
+    for (const [id, handler] of Object.entries(menuItems)) {
+      const el = document.getElementById(id);
+      if (!el) continue;
+      el.addEventListener('click', handler);
+      el.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handler(); }
+      });
     }
   }
 
-  exitFullscreen() {
-    if (!this.fullscreenCamId) return;
-    const wrapper = document.getElementById(`cam${this.fullscreenCamId}`);
-    if (wrapper) wrapper.classList.remove('fullscreen');
-    this.fullscreenCamId = null;
+  toggleMenu() {
+    this._isMenuVisible = !this._isMenuVisible;
+    this._menuOverlay.classList.toggle('hidden', !this._isMenuVisible);
+    if (this._isMenuVisible) document.getElementById('menu-feed')?.focus();
+  }
+
+  // ── Settings ──────────────────────────────────────────────────────────────
+
+  _bindSettings() {
+    this._requireEl('save-settings').addEventListener('click', () => this.saveSettings());
+    // Header X and footer Cancel both close settings
+    const cancel = () => { if (this._isSettingsVisible) this.toggleSettings(); };
+    this._requireEl('cancel-settings').addEventListener('click', cancel);
+    document.getElementById('cancel-settings-2')?.addEventListener('click', cancel);
   }
 
   toggleSettings() {
-    this.isSettingsVisible = !this.isSettingsVisible;
-    this.settingsOverlay.classList.toggle('hidden', !this.isSettingsVisible);
-
-    if (this.isSettingsVisible) {
-      this.populateSettingsForm();
-    }
+    this._isSettingsVisible = !this._isSettingsVisible;
+    this._settingsOverlay.classList.toggle('hidden', !this._isSettingsVisible);
+    if (this._isSettingsVisible) this._populateSettingsForm();
   }
 
-  populateSettingsForm() {
-    const s = this.app.settings;
-    this.refreshInput.value = s.refresh_interval || DEFAULT_REFRESH_INTERVAL;
-    this.hostsInput.value = (s.candidate_hosts || []).join('\n');
-    
-    // We will dynamically add camera URL inputs if they don't exist in HTML
-    // But for this rewrite, let's stick to what's in HTML or add them via JS if needed.
-    // The previous HTML didn't have camera URL inputs, which is a bug/missing feature.
-    // I should generate them.
-    this.renderCameraInputs();
-  }
-  
-  renderCameraInputs() {
-      const container = document.querySelector('.settings-content .camera-urls');
-      if (!container) return; // Need to add this container in HTML
-      
-      container.innerHTML = '';
-      [1,2,3,4].forEach(id => {
-          const div = document.createElement('div');
-          div.className = 'settings-group';
-          div.innerHTML = `
-            <label>Camera ${id} URL:</label>
-            <input type="text" id="cam-url-${id}" value="${this.app.settings[`camera${id}_url`] || ''}" placeholder="http://ip/snapshot.jpg">
-          `;
-          container.appendChild(div);
-      });
+  _populateSettingsForm() {
+    this._refreshInput.value = this._settings.refresh_interval
+      ?? (CONFIG.DEFAULT_REFRESH_MS / 1_000);
+    this._hostsInput.value   = (this._settings.candidate_hosts || []).join('\n');
   }
 
   async saveSettings() {
-    const newRefresh = parseInt(this.refreshInput.value, 10);
-    const newHosts = this.hostsInput.value.split('\n').map(h => h.trim()).filter(h => h);
-    
-    if (isNaN(newRefresh) || newRefresh < 1) {
-      alert('Invalid refresh interval');
+    const newRefreshSec = parseInt(this._refreshInput.value, 10);
+    if (!Number.isFinite(newRefreshSec) || newRefreshSec < 1) {
+      alert('Refresh interval must be a whole number of seconds (minimum 1).');
       return;
     }
 
+    const newHosts = this._hostsInput.value
+      .split('\n').map(h => h.trim()).filter(Boolean);
+
+    // Spread existing settings so camera URLs and adjustments are preserved.
     const newSettings = {
-      ...this.app.settings,
-      refresh_interval: newRefresh,
-      candidate_hosts: newHosts
+      ...this._settings,
+      refresh_interval: newRefreshSec,
+      candidate_hosts:  newHosts,
     };
 
-    // Collect Camera URLs
-    [1,2,3,4].forEach(id => {
-        const input = document.getElementById(`cam-url-${id}`);
-        if (input) newSettings[`camera${id}_url`] = input.value.trim();
-    });
+    if (!window.electronAPI?.saveSettings) {
+      alert('Settings API unavailable — check the Electron preload script.');
+      return;
+    }
 
     try {
       const result = await window.electronAPI.saveSettings(newSettings);
-      if (result.error) {
-        alert('Failed to save settings: ' + result.error);
+      if (result?.error) {
+        alert(`Failed to save: ${result.error}`);
       } else {
         this.toggleSettings();
-        window.location.reload(); // Reload to apply changes cleanly
+        window.location.reload();
       }
-    } catch (e) {
-      console.error('Save failed', e);
-      alert('Save failed: ' + e.message);
+    } catch (err) {
+      console.error('[Settings] Save failed:', err);
+      alert(`Save failed: ${err.message}`);
     }
+  }
+
+  // ── Debug ─────────────────────────────────────────────────────────────────
+
+  _bindDebug() {
+    document.getElementById('close-debug')
+      ?.addEventListener('click', () => { if (this._isDebugVisible) this.toggleDebug(); });
   }
 
   toggleDebug() {
-    this.isDebugVisible = !this.isDebugVisible;
-    this.debugOverlay.classList.toggle('hidden', !this.isDebugVisible);
-  }
+    this._isDebugVisible = !this._isDebugVisible;
+    this._debugOverlay.classList.toggle('hidden', !this._isDebugVisible);
 
-  startDebugLoop() {
-    setInterval(() => this.updateDebugUI(), 1000);
-  }
-
-  updateDebugUI() {
-    if (!this.isDebugVisible) return;
-
-    const refreshInterval = this.app.settings.refresh_interval || DEFAULT_REFRESH_INTERVAL;
-    let totalBps = 0;
-    
-    let html = `
-      <div class="debug-section">
-        <h4>System Info</h4>
-        <p><span>Active Host:</span> <span class="debug-value">${this.app.network.activeHost || 'Scanning...'}</span></p>
-        <p><span>Refresh:</span> <span class="debug-value">${refreshInterval}s</span></p>
-      </div>
-    `;
-
-    this.app.cameras.forEach(cam => {
-      const bps = cam.stats.bytes / refreshInterval;
-      totalBps += bps;
-      
-      html += `
-        <div class="debug-section">
-          <h4>Camera ${cam.id}</h4>
-          <p><span>Last:</span> <span class="debug-value">${cam.stats.lastFetch || '-'}</span></p>
-          <p><span>Size:</span> <span class="debug-value">${formatBytes(cam.stats.bytes)}</span></p>
-          <p><span>Speed:</span> <span class="debug-value">${formatBytes(bps)}/s</span></p>
-          <p><span>Total:</span> <span class="debug-value">${formatBytes(cam.stats.totalBytes)}</span></p>
-          <div class="debug-error">
-            ${cam.stats.errors.length > 0 ? 'Errors:<br>' + cam.stats.errors.slice(-2).join('<br>') : 'OK'}
-          </div>
-        </div>
-      `;
-    });
-
-    html += `
-      <div class="debug-section">
-        <h4>Total Bandwidth</h4>
-        <p><span>Usage:</span> <span class="debug-value">${formatBytes(totalBps)}/s</span></p>
-      </div>
-    `;
-
-    this.debugContent.innerHTML = html;
-  }
-
-  updateGlobalStatus(status) {
-      // Could be used to show a global connection icon
-  }
-}
-
-class App {
-  constructor() {
-    this.settings = {};
-    this.cameras = [];
-    this.network = new NetworkManager(this);
-    this.ui = null; // Initialized after DOM ready
-    this.feedInterval = null;
-  }
-
-  async init() {
-    try {
-      this.settings = await window.electronAPI.loadSettings();
-      if (this.settings.error) {
-        console.error('Settings error:', this.settings.error);
-      }
-
-      this.ui = new UIManager(this);
-      
-      // Initialize Cameras
-      for (let i = 1; i <= CAMERAS_COUNT; i++) {
-        this.cameras.push(new CameraFeed(i, this));
-      }
-
-      // Initialize Network
-      this.network.setCandidates(this.settings.candidate_hosts || []);
-      
-      // Try to deduce initial host from Camera 1 URL
-      if (this.settings.camera1_url) {
-        try {
-            const url = new URL(this.settings.camera1_url);
-            this.network.activeHost = url.hostname;
-        } catch(e) {}
-      }
-
-      // Initial Network Scan
-      await this.network.findActiveHost();
-
-      // Start Feeds
-      this.restartFeeds();
-
-    } catch (err) {
-      console.error('Initialization failed:', err);
+    if (this._isDebugVisible) {
+      this._updateDebugUI();
+      this._debugTimer = setInterval(() => this._updateDebugUI(), CONFIG.DEBUG_UPDATE_MS);
+    } else {
+      clearInterval(this._debugTimer);
+      this._debugTimer = null;
     }
   }
 
-  restartFeeds() {
-    if (this.feedInterval) clearInterval(this.feedInterval);
+  _updateDebugUI() {
+    const refreshSec = this._settings.refresh_interval ?? (CONFIG.DEFAULT_REFRESH_MS / 1_000);
+    const fragment   = document.createDocumentFragment();
 
-    const refreshMs = (this.settings.refresh_interval || DEFAULT_REFRESH_INTERVAL) * 1000;
+    const sys = this._debugSection('System');
+    sys.append(
+      this._debugRow('Active Host', this._network.activeHost || '—'),
+      this._debugRow('Refresh',     `${refreshSec}s`),
+      this._debugRow('Scanning',    this._network._isScanning ? 'Yes' : 'No'),
+    );
+    fragment.append(sys);
 
-    // Trigger immediate update
-    this.updateAllCameras();
+    let totalBps = 0;
+    this._cameras.forEach(cam => {
+      const bps = cam.stats.bytes / refreshSec;
+      totalBps += bps;
+      const sec = this._debugSection(`Camera ${cam.id}`);
+      sec.append(
+        this._debugRow('Last fetch', cam.stats.lastFetch || '—'),
+        this._debugRow('Frame size', formatBytes(cam.stats.bytes)),
+        this._debugRow('Speed',      `${formatBytes(bps)}/s`),
+        this._debugRow('Total',      formatBytes(cam.stats.totalBytes)),
+        this._debugRow('Fetches',    String(cam.stats.fetchCount)),
+        this._debugRow('Errors',     cam.stats.errors.length
+          ? cam.stats.errors.slice(-2).join(' | ') : 'None'),
+      );
+      fragment.append(sec);
+    });
 
-    // Start interval
-    this.feedInterval = setInterval(() => {
-      this.updateAllCameras();
-    }, refreshMs);
+    const bw = this._debugSection('Total Bandwidth');
+    bw.append(this._debugRow('Usage', `${formatBytes(totalBps)}/s`));
+    fragment.append(bw);
+
+    this._debugContent.replaceChildren(fragment);
   }
 
-  updateAllCameras() {
-    this.cameras.forEach((cam, index) => {
-      // Stagger requests to reduce network spikes
-      setTimeout(() => {
-        cam.update();
-      }, index * 250);
-    });
+  _debugSection(title) {
+    const div = document.createElement('div');
+    div.className = 'debug-section';
+    const h4 = document.createElement('h4');
+    h4.textContent = title;
+    div.append(h4);
+    return div;
+  }
+
+  _debugRow(label, value) {
+    const p   = document.createElement('p');
+    const lbl = document.createElement('span');
+    const val = document.createElement('span');
+    val.className   = 'debug-value';
+    lbl.textContent = `${label}:`;
+    val.textContent = value;
+    p.append(lbl, val);
+    return p;
+  }
+
+  // ── Global Status ─────────────────────────────────────────────────────────
+
+  _setGlobalStatus(status, host) {
+    if (!this._globalBadge) return;
+    const labels = {
+      online:   `● ${host}`,
+      offline:  '● Offline',
+      scanning: '◌ Scanning…',
+    };
+    this._globalBadge.textContent    = labels[status] ?? status;
+    this._globalBadge.dataset.status = status;
+  }
+
+  // ── Fullscreen ────────────────────────────────────────────────────────────
+
+  _handleFullscreen(id) {
+    if (this._fullscreenId) {
+      this._exitFullscreen();
+    } else {
+      const el = document.getElementById(`cam${id}`);
+      if (el) { el.classList.add('fullscreen'); this._fullscreenId = id; }
+    }
+  }
+
+  _exitFullscreen() {
+    if (!this._fullscreenId) return;
+    document.getElementById(`cam${this._fullscreenId}`)?.classList.remove('fullscreen');
+    this._fullscreenId = null;
+  }
+
+  // ── Bus ───────────────────────────────────────────────────────────────────
+
+  _bindBusEvents() {
+    this._bus.on('ui:toggleFullscreen', id => this._handleFullscreen(id));
+    this._bus.on('network:online',   host => this._setGlobalStatus('online',   host));
+    this._bus.on('network:offline',  ()   => this._setGlobalStatus('offline',  null));
+    this._bus.on('network:scanning', ()   => this._setGlobalStatus('scanning', null));
+  }
+
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
+
+  destroy() {
+    clearInterval(this._debugTimer);
+    clearInterval(this._clockTimer);
+    window.removeEventListener('keydown', this._onKeyDown);
   }
 }
 
-// --- Main Entry Point ---
+// ─── App ──────────────────────────────────────────────────────────────────────
+
+class App {
+  constructor() {
+    this._bus          = new EventBus();
+    this._settings     = {};
+    this._network      = null;
+    this._cameras      = [];
+    this._ui           = null;
+    this._feedInterval = null;
+    this._firstLoad    = true;
+  }
+
+  async init() {
+    if (!window.electronAPI?.loadSettings || !window.electronAPI?.saveSettings) {
+      console.error('[App] window.electronAPI not available. Check preload.js.');
+      return;
+    }
+
+    // 1. Settings
+    try {
+      const result = await window.electronAPI.loadSettings();
+      this._settings = result?.error ? {} : (result || {});
+      if (result?.error) console.warn('[App] Settings warning:', result.error);
+    } catch (err) {
+      console.error('[App] Could not load settings:', err);
+      this._settings = {};
+    }
+
+    // 2. Network
+    this._network = new NetworkManager(this._bus);
+    this._network.setCandidates(this._settings.candidate_hosts || []);
+
+    // Pre-seed active host from settings so cameras attempt fetches immediately.
+    const cam1Url = this._settings['camera1_url'] || DEFAULT_URL_TEMPLATES[1];
+    try {
+      const h = new URL(cam1Url).hostname;
+      if (h) this._network.activeHost = h;
+    } catch { /* bad URL */ }
+
+    // 3. Cameras + UI
+    for (let id = 1; id <= CONFIG.CAMERA_COUNT; id++) {
+      try {
+        this._cameras.push(new CameraFeed(id, this._bus, this._network, this._settings));
+      } catch (err) {
+        console.error(`[App] CameraFeed ${id} failed:`, err);
+      }
+    }
+
+    this._ui = new UIManager(this._bus, this._settings, this._cameras, this._network);
+
+    // 4. React to network
+    this._bus.on('network:online', () => {
+      if (this._firstLoad) {
+        this._firstLoad = false;
+        this._syncLoadAllCameras(); // all 4 at once — first frame is always sync
+        this._startInterval();
+      } else {
+        this._startInterval();      // host recovered after errors
+      }
+    });
+
+    // 5. Start discovery (non-blocking)
+    this._network.findActiveHost();
+  }
+
+  _syncLoadAllCameras() {
+    console.log('[App] Sync-loading all cameras simultaneously…');
+    this._cameras.forEach(cam => cam.update());
+  }
+
+  _startInterval() {
+    if (this._feedInterval !== null) {
+      clearInterval(this._feedInterval);
+      this._feedInterval = null;
+    }
+    const refreshMs = this._settings.refresh_interval
+      ? this._settings.refresh_interval * 1_000
+      : CONFIG.DEFAULT_REFRESH_MS;
+
+    this._feedInterval = setInterval(() => {
+      this._cameras.forEach((cam, idx) => {
+        setTimeout(() => cam.update(), idx * CONFIG.STAGGER_MS);
+      });
+    }, refreshMs);
+
+    console.log(`[App] Feed interval: ${refreshMs / 1_000}s`);
+  }
+
+  destroy() {
+    if (this._feedInterval !== null) clearInterval(this._feedInterval);
+    this._cameras.forEach(c => c.destroy());
+    this._ui?.destroy();
+    this._network?.destroy();
+    this._bus.destroy();
+  }
+}
+
+// ─── Bootstrap ────────────────────────────────────────────────────────────────
+
 const app = new App();
 
 window.addEventListener('DOMContentLoaded', () => {
-  app.init();
+  app.init().catch(err => console.error('[App] Fatal init error:', err));
 });
+
+window._app = app;
